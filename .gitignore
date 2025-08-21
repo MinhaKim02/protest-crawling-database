@@ -1,0 +1,30 @@
+# Python 캐시/바이트코드
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 데이터베이스 파일 (로컬 테스트용만 무시)
+*.db
+*.sqlite3
+
+# 가상환경
+venv/
+env/
+.venv/
+
+# macOS
+.DS_Store
+
+# 로그
+*.log
+
+# 비밀 설정 (환경 변수)
+.env
+*.secret.json
+
+# 주피터 노트북 체크포인트
+.ipynb_checkpoints/
+
+# VSCode
+.vscode/
