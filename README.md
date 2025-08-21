@@ -28,6 +28,8 @@ Selenium + BeautifulSoup + VWorld API를 활용하여 매일 오전 8시 자동�
 ```bash
 pip install -r requirements.txt
 python crawler.py —out data/집회_정보.csv
+```
+
 
 ## 🕐 실행 스케줄 (GitHub Actions)
 - **crawler.py** → 매일 오전 8시 (KST) 자동 실행  
