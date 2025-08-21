@@ -4,6 +4,7 @@ import datetime
 import os
 import ast
 import glob
+import pytz
 
 app = FastAPI()
 
@@ -14,7 +15,8 @@ async def today_protests(request: Request):
     body = await request.json()  # 카카오 요청 body (사용 안 해도 됨)
 
     # 오늘 날짜 파일명
-    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    KST = pytz.timezone("Asia/Seoul")
+    today_str = datetime.datetime.now(KST).strftime("%Y-%m-%d")
     file_name = f"집회_정보_{today_str}.csv"
     file_path = os.path.join(DATA_DIR, file_name)
 
