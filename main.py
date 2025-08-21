@@ -1,51 +1,69 @@
-import ast
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 import pandas as pd
-from datetime import datetime
+import datetime
+import os
+import ast
 
 app = FastAPI()
 
-@app.get("/today-protests")
-def today_protests():
-    today = datetime.now().strftime("%Y-%m-%d")
-    url = f"https://raw.githubusercontent.com/MinhaKim02/protest-crawling-database/main/data/집회_정보_{today}.csv"
+DATA_DIR = "data"  # 크롤러 저장 경로
 
-    try:
-        df = pd.read_csv(url)
-    except Exception:
-        return {"message": f"📢 오늘({today})은 예정된 집회가 없습니다."}
+@app.post("/today-protests")
+async def today_protests(request: Request):
+    body = await request.json()  # 카카오 요청 body (사용 안 해도 됨)
 
-    if df.empty:
-        return {"message": f"📢 오늘({today})은 예정된 집회가 없습니다."}
+    # 오늘 날짜 (예: 집회_정보_2025-08-22.csv)
+    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    file_name = f"집회_정보_{today_str}.csv"
+    file_path = os.path.join(DATA_DIR, file_name)
 
-    protests = []
+    # CSV 없으면 안내
+    if not os.path.exists(file_path):
+        return {
+            "version": "2.0",
+            "template": {
+                "outputs": [
+                    {"simpleText": {"text": "📢 오늘은 등록된 집회 정보가 없습니다."}}
+                ]
+            }
+        }
+
+    # CSV 읽기
+    df = pd.read_csv(file_path)
+    total_count = len(df)
+
+    # 메시지 만들기
+    text = f"📢 오늘({today_str}) 종로구 집회 정보\n"
+    text += f"총 {total_count}건의 집회가 예정되어 있습니다.\n\n"
+
     for _, row in df.iterrows():
-        # 장소 컬럼 처리
-        try:
-            places = ast.literal_eval(row['장소'])
-            if isinstance(places, list):
-                place_text = " - ".join(places)
-            else:
-                place_text = str(places)
-        except:
-            place_text = str(row['장소'])
+        start = row.get("start_time", "")
+        end = row.get("end_time", "")
 
-        # 혼잡도 아이콘
-        people = int(row['인원'])
-        if people > 1000:
-            congestion = "🔴 매우 혼잡"
-        elif people > 500:
-            congestion = "🟡 혼잡"
-        else:
-            congestion = "🟢 원활"
+        # 장소 처리
+        locations = row.get("장소", "")
+        if isinstance(locations, str) and locations.startswith("["):
+            try:
+                loc_list = ast.literal_eval(locations)
+                locations = " - ".join(loc_list)
+            except Exception:
+                pass
 
-        protest_info = (
-            f"⏰ {row['start_time']} ~ {row['end_time']}\n"
-            f"📍 장소: {place_text}\n"
-            f"👥 예상 인원: {people}명 ({congestion})"
-        )
-        protests.append(protest_info)
+        # 인원 처리 (없으면 생략)
+        people = row.get("인원", "")
+        people_text = f"\n👥 약 {people}명" if pd.notna(people) and str(people).strip() else ""
 
-    response_text = f"📅 오늘({today}) 종로구 집회 정보\n\n" + "\n\n".join(protests)
+        text += f"🕒 {start}~{end}\n📍 {locations}{people_text}\n\n"
 
-    return {"message": response_text}
+    return {
+        "version": "2.0",
+        "template": {
+            "outputs": [
+                {"simpleText": {"text": text.strip()}}
+            ]
+        }
+    }
+
+@app.get("/")
+def home():
+    return {"message": "✅ protest-crawling-database API is running!"}
