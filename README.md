@@ -28,3 +28,28 @@ Selenium + BeautifulSoup + VWorld API를 활용하여 매일 오전 8시 자동�
 ```bash
 pip install -r requirements.txt
 python crawler.py —out data/집회_정보.csv
+
+## 🕐 실행 스케줄 (GitHub Actions)
+- **crawler.py** → 매일 오전 8시 (KST) 자동 실행  
+  - cron: `"0 23 * * *"` (UTC 기준, 한국시간 08:00)  
+- **integrated_crawler.py** → 매일 오후 8시 (KST) 자동 실행  
+  - cron: `"0 11 * * *"` (UTC 기준, 한국시간 20:00)  
+- 수동 실행도 가능 (`workflow_dispatch` 지원)
+
+## 🗂️ 데이터 저장 규칙
+
+### `crawler.py`
+- 파일명: `집회_정보_YYYY-MM-DD.csv`  
+  → `YYYY-MM-DD`는 **집회가 실제 열리는 날짜**  
+- 저장 방식: **병합 모드**
+  - 같은 날짜 CSV가 이미 있으면 불러와서 새 데이터와 **중복 제거 + 보강 후 저장**
+  - 완전히 동일한 집회는 건너뜀
+  - 일부 필드가 비어 있던 경우, 새 데이터에 값이 있으면 해당 필드만 채움  
+    (예: 기존에 `위도`가 없는데 새 데이터에 있으면 보강)
+
+### `integrated_crawler.py`
+- 파일명: `집회_정보_YYYY-MM-DD.csv`  
+  → `YYYY-MM-DD`는 **집회가 실제 열리는 날짜**  
+- 저장 방식: **덮어쓰기 모드**
+  - 항상 새로 크롤링한 데이터로 덮어씀
+  - 기존 데이터와 병합하지 않음
