@@ -27,6 +27,7 @@ import time
 import argparse
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
+from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup, NavigableString
@@ -43,6 +44,10 @@ try:
     SELENIUM_AVAILABLE = True
 except Exception:
     SELENIUM_AVAILABLE = False
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 
 DETAIL_URL_FMT = "https://www.spatic.go.kr/spatic/assem/getInfoView.do?mgrSeq={mgrSeq}"
 LIST_URL       = "https://www.spatic.go.kr/spatic/main/assem.do"
@@ -149,7 +154,7 @@ def setup_selenium_driver_for_list(headless: bool=True):
         if headless:
             options.add_argument("--headless=new")
         service = ChromeService()  # Selenium Manager 사용
-        driver = webdriver.Chrome(service=service, options=options)
+        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()))
         return driver
     except Exception:
         return None
@@ -903,15 +908,15 @@ def main():
     # 4) CSV 저장
     final_records = records_to_csv_rows(ymd, grouped)
 
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)  # data 폴더 자동 생성
+    today = datetime.now().strftime("%Y-%m-%d")   # 오늘 날짜
+    out_path = Path(f"data/집회_정보_{today}.csv")  # 날짜 붙은 파일명
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     save_csv_new_schema(final_records, str(out_path))
 
-    ymd_str = "-".join(ymd) if ymd and all(ymd) else ""
     print(
-        f"[완료] {args.out} 저장 "
+        f"[완료] {out_path} 저장 "
         f"(총 {len(final_records)}건, 종로구 필터 적용 / 선택 URL={chosen_url}"
-        f"{' / 날짜=' + ymd_str if ymd_str else ''})"
+        f"{' / 날짜=' + today})"
     )
 
 if __name__ == "__main__":
