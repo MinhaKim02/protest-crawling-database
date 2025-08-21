@@ -823,7 +823,7 @@ def main():
     p = argparse.ArgumentParser(description="SPATIC 집회·통제정보 크롤러 (Selenium 목록 기반 / 새 CSV 스키마 / VWorld 지오코딩)")
     p.add_argument("--url", help="게시글 URL 직접 지정 (지정 시 mgrSeq/목록 무시)")
     p.add_argument("--mgr-seq", type=int, help="mgrSeq 직접 지정 (예: 1177)")
-    p.add_argument("--out", default="집회_정보.csv", help="저장 CSV 경로 (기본: 집회_정보.csv)")
+    p.add_argument("--out", default="data/집회_정보.csv", help="저장 CSV 경로 (기본: data/집회_정보.csv)")
     p.add_argument("--debug", action="store_true", help="파싱/선택 근거 로그 출력")
     p.add_argument("--debug-html", action="store_true", help="원본 HTML을 debug/ 폴더에 저장")
     p.add_argument("--vworld-key", default=None, help="VWorld API Key (기본: 환경변수 VWORLD_KEY 또는 내장 기본키)")
@@ -902,7 +902,10 @@ def main():
 
     # 4) CSV 저장
     final_records = records_to_csv_rows(ymd, grouped)
-    save_csv_new_schema(final_records, args.out)
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)  # data 폴더 자동 생성
+    save_csv_new_schema(final_records, str(out_path))
 
     ymd_str = "-".join(ymd) if ymd and all(ymd) else ""
     print(
