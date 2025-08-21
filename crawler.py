@@ -49,6 +49,67 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
+# ---------------------------
+# CSV 저장/불러오기
+# ---------------------------
+def save_csv(records: list[dict], path: str):
+    fieldnames = ["년","월","일","start_time","end_time","장소","인원","위도","경도","비고"]
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in records:
+            writer.writerow(r)
+
+def load_csv(path: str) -> list[dict]:
+    if not Path(path).exists():
+        return []
+    with open(path, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        return list(reader)
+
+# ---------------------------
+# 중복 판별 & 병합
+# ---------------------------
+def normalize_place_list(place_str: str) -> str:
+    try:
+        places = json.loads(place_str)
+        places = [p.replace(" ", "").lower() for p in places]
+        return "|".join(sorted(places))
+    except:
+        return place_str
+
+def make_key(r: dict):
+    """중복 여부를 판별하기 위한 key"""
+    return (
+        r["년"], r["월"], r["일"],
+        r["start_time"], r["end_time"],
+        normalize_place_list(r["장소"])
+    )
+
+def merge_records(existing: list[dict], new: list[dict]) -> list[dict]:
+    merged = { make_key(r): r for r in existing }
+    for r in new:
+        key = make_key(r)
+        if key not in merged:
+            merged[key] = r
+        else:
+            # 보강: 기존에 비어 있으면 새 데이터로 채움
+            for field in ["위도","경도","인원","비고"]:
+                if (not merged[key].get(field)) and r.get(field):
+                    merged[key][field] = r[field]
+    return list(merged.values())
+
+# ---------------------------
+# 날짜 추출
+# ---------------------------
+def extract_ymd_from_title(title: str):
+    m = re.search(r"(\d{2})(\d{2})(\d{2})", title)
+    if m:
+        yy, mm, dd = m.groups()
+        return f"20{yy}", mm, dd
+    return None
+
+
 DETAIL_URL_FMT = "https://www.spatic.go.kr/spatic/assem/getInfoView.do?mgrSeq={mgrSeq}"
 LIST_URL       = "https://www.spatic.go.kr/spatic/main/assem.do"
 
@@ -908,15 +969,24 @@ def main():
     # 4) CSV 저장
     final_records = records_to_csv_rows(ymd, grouped)
 
-    today = datetime.now().strftime("%Y-%m-%d")   # 오늘 날짜
-    out_path = Path(f"data/집회_정보_{today}.csv")  # 날짜 붙은 파일명
+    # --- 파일명: 집회 날짜 기준 ---
+    if ymd and all(ymd):
+        date_str = f"{ymd[0]}-{ymd[1]}-{ymd[2]}"
+    else:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+
+    out_path = Path(f"data/집회_정보_{date_str}.csv")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    save_csv_new_schema(final_records, str(out_path))
+
+    # --- 기존 파일이 있으면 병합 ---
+    existing = load_csv(str(out_path))
+    merged = merge_records(existing, final_records)
+    save_csv(merged, str(out_path))
 
     print(
         f"[완료] {out_path} 저장 "
-        f"(총 {len(final_records)}건, 종로구 필터 적용 / 선택 URL={chosen_url}"
-        f"{' / 날짜=' + today})"
+        f"(총 {len(merged)}건, 종로구 필터 적용 / 선택 URL={chosen_url}"
+        f" / 날짜={date_str})"
     )
 
 if __name__ == "__main__":

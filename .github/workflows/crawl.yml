@@ -2,35 +2,48 @@ name: Daily Crawl
 
 on:
   schedule:
-    - cron: "0 23 * * *"   # 한국시간 08:00 (UTC+0 기준 23:00)
-  workflow_dispatch:        # 수동 실행도 가능
+    - cron: "0 23 * * *"   # 한국시간 08:00 (UTC 23:00)
+    - cron: "0 11 * * *"   # 한국시간 20:00 (UTC 11:00)
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  morning-crawl:
+    if: github.event.schedule == '0 23 * * *'
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
         with:
           python-version: "3.9"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run crawler
+      - run: pip install -r requirements.txt
+      - name: Run crawler.py
         run: python crawler.py
-
       - name: Commit and push results
         run: |
           git config --local user.email "actions@github.com"
           git config --local user.name "GitHub Actions"
           git add data/
-          git commit -m "Add protest data for $(date +'%Y-%m-%d')" || echo "No changes to commit"
+          git commit -m "Morning crawl for $(date +'%Y-%m-%d')" || echo "No changes to commit"
+          git push
+
+  evening-crawl:
+    if: github.event.schedule == '0 11 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.9"
+      - run: pip install -r requirements.txt
+      - name: Run integrated_crawler.py
+        run: python integrated_crawler.py
+      - name: Commit and push results
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git add data/
+          git commit -m "Evening crawl for $(date +'%Y-%m-%d')" || echo "No changes to commit"
           git push
