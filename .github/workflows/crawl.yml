@@ -10,7 +10,8 @@ permissions:
   contents: write
 
 jobs:
-  crawl:
+  morning-crawl:
+    if: github.event.schedule == '0 23 * * *'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -18,21 +19,31 @@ jobs:
         with:
           python-version: "3.9"
       - run: pip install -r requirements.txt
-
-      - name: Run crawler (morning or evening)
-        run: |
-          if [ "$(date +'%H')" = "23" ]; then
-            echo ">>> Morning crawl (KST 08:00)"
-            python crawler.py
-          else
-            echo ">>> Evening crawl (KST 20:00)"
-            python integrated_crawler.py
-          fi
-
-      - name: Commit and push results
+      - name: Run morning crawler
+        run: python crawler.py
+      - name: Commit and push morning results
         run: |
           git config --local user.email "actions@github.com"
           git config --local user.name "GitHub Actions"
           git add data/
-          git commit -m "Crawl run at $(date -u +'%Y-%m-%d %H:%M:%S UTC')" || echo "No changes to commit"
+          git commit -m "Morning crawl at $(TZ=Asia/Seoul date +'%Y-%m-%d %H:%M:%S KST')" || echo "No changes to commit"
+          git push
+
+  evening-crawl:
+    if: github.event.schedule == '0 11 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.9"
+      - run: pip install -r requirements.txt
+      - name: Run evening crawler
+        run: python integrated_crawler.py
+      - name: Commit and push evening results
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git add data/
+          git commit -m "Evening crawl at $(TZ=Asia/Seoul date +'%Y-%m-%d %H:%M:%S KST')" || echo "No changes to commit"
           git push
