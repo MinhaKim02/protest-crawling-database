@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SPATIC 집회·통제정보 크롤러 (Selenium 목록 기반 mgrSeq 선택 + VWorld 지오코딩)
-- 결과 CSV 스키마 (모든 필드는 문자열; 리스트는 JSON 문자열):
+SPATIC 집회·통제정보 크롤러 (Selenium 목록 기반 mgrSeq 선택 + VWorld 지오코딩, 맥락 스코어링+BBOX 강화)
+- 결과 CSV 스키마(문자열; 리스트는 JSON 문자열):
   ['년','월','일','start_time','end_time','장소','인원','위도','경도','비고']
 
-요점
-- Selenium으로 목록 페이지에서 '행사 및 집회' 포함 게시글만 필터 → 그중 가장 큰 mgrSeq 선택
-- 목록 테이블의 날짜 텍스트를 파싱하여 '년/월/일' 채움(YYYY-MM-DD/., 'YYYY년 M월 D일', 범위는 첫 날짜)
-- 상세 페이지 파싱은 requests + BeautifulSoup
-- 동일 집회 추정: (start_time, end_time) 키로 그룹핑
-- 장소/위도/경도는 리스트(JSON 문자열) 저장
-- VWorld 지오코딩(후보 확장/스코어링 포함): 장소 리스트와 동일한 순서/길이로 위도·경도 리스트 저장(실패는 null)
-
 의존:
-- requests
-- beautifulsoup4
-- selenium (목록 선택 전용)
+  - requests, beautifulsoup4, selenium
+
+사용 예:
+  python spatic_crawler.py --out 집회_정보.csv --debug --vworld-key YOUR_VWORLD_KEY
+  # BBOX 가중치(종로+중구 느슨): 기본값
+  python spatic_crawler.py --bbox jj_loose --bbox-mode boost
+  # BBOX 엄격 필터(종로+중구 타이트):
+  python spatic_crawler.py --bbox jj_tight --bbox-mode strict
 """
 
 import re
@@ -27,13 +24,12 @@ import time
 import argparse
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
-from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup, NavigableString
 from bs4 import FeatureNotFound
 
-# --- Selenium(필수: 목록 선택 전용) -----------------------------------------
+# --- Selenium(목록 선택 전용) -----------------------------------------
 try:
     from selenium import webdriver
     from selenium.webdriver.common.by import By
@@ -44,71 +40,6 @@ try:
     SELENIUM_AVAILABLE = True
 except Exception:
     SELENIUM_AVAILABLE = False
-
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-
-# ---------------------------
-# CSV 저장/불러오기
-# ---------------------------
-def save_csv(records: list[dict], path: str):
-    fieldnames = ["년","월","일","start_time","end_time","장소","인원","위도","경도","비고"]
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for r in records:
-            writer.writerow(r)
-
-def load_csv(path: str) -> list[dict]:
-    if not Path(path).exists():
-        return []
-    with open(path, "r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        return list(reader)
-
-# ---------------------------
-# 중복 판별 & 병합
-# ---------------------------
-def normalize_place_list(place_str: str) -> str:
-    try:
-        places = json.loads(place_str)
-        places = [p.replace(" ", "").lower() for p in places]
-        return "|".join(sorted(places))
-    except:
-        return place_str
-
-def make_key(r: dict):
-    """중복 여부를 판별하기 위한 key"""
-    return (
-        r["년"], r["월"], r["일"],
-        r["start_time"], r["end_time"],
-        normalize_place_list(r["장소"])
-    )
-
-def merge_records(existing: list[dict], new: list[dict]) -> list[dict]:
-    merged = { make_key(r): r for r in existing }
-    for r in new:
-        key = make_key(r)
-        if key not in merged:
-            merged[key] = r
-        else:
-            # 보강: 기존에 비어 있으면 새 데이터로 채움
-            for field in ["위도","경도","인원","비고"]:
-                if (not merged[key].get(field)) and r.get(field):
-                    merged[key][field] = r[field]
-    return list(merged.values())
-
-# ---------------------------
-# 날짜 추출
-# ---------------------------
-def extract_ymd_from_title(title: str):
-    m = re.search(r"(\d{2})(\d{2})(\d{2})", title)
-    if m:
-        yy, mm, dd = m.groups()
-        return f"20{yy}", mm, dd
-    return None
-
 
 DETAIL_URL_FMT = "https://www.spatic.go.kr/spatic/assem/getInfoView.do?mgrSeq={mgrSeq}"
 LIST_URL       = "https://www.spatic.go.kr/spatic/main/assem.do"
@@ -122,18 +53,24 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 
-# 종로구 관련 키워드
-JONGNO_KEYWORDS = [
-    "종로구", "광화문", "광화문광장", "경복궁", "안국", "안국역", "인사동",
-    "종각", "종로", "세종문화회관", "정부서울청사", "교보빌딩", "정곡빌딩",
-    "사직로", "율곡로", "자하문로", "청와대로", "수송동", "신문로", "서린로"
-]
-
 # ─────────────── VWorld 설정 ───────────────
-# 제공해주신 키를 기본값으로 사용합니다(옵션/환경변수로 덮어쓰기 가능).
 DEFAULT_VWORLD_KEY = "46AEEE06-EE1D-3C1F-A4A4-E38D578695E8"
 VWORLD_SEARCH_URL = "https://api.vworld.kr/req/search"
 VWORLD_ADDR_URL   = "https://api.vworld.kr/req/address"
+
+# ─────────────── BBOX(좌표 범위) 설정 ───────────────
+# (lat_min, lat_max, lon_min, lon_max)
+BBOXES: Dict[str, Tuple[float, float, float, float]] = {
+    "seoul":    (37.38, 37.72, 126.76, 127.18),  # 서울 대략값
+    "jj_loose": (37.53, 37.61, 126.95, 127.03),  # 종로+중구 느슨
+    "jj_tight": (37.55, 37.60, 126.96, 127.02),  # 종로+중구 타이트
+}
+def _in_bbox(lat: float, lon: float, bbox: Tuple[float, float, float, float]) -> bool:
+    try:
+        lat_min, lat_max, lon_min, lon_max = bbox
+        return (lat_min <= float(lat) <= lat_max) and (lon_min <= float(lon) <= lon_max)
+    except Exception:
+        return False
 
 # ─────────────── 공통 유틸 ───────────────
 def normalize_spaces(s: str) -> str:
@@ -150,7 +87,6 @@ def clean_text(s: str) -> str:
     return s
 
 def soup_preprocess(soup: BeautifulSoup):
-    # <br> → '\n' 로 바꿔서 줄 단위 파싱 안정화
     for br in soup.find_all("br"):
         br.replace_with(NavigableString("\n"))
 
@@ -181,16 +117,14 @@ def _is_event_post(title: str) -> bool:
     return ("행사" in t) and ("집회" in t)
 
 def _to_int_or_none(s: str) -> Optional[int]:
-    if s is None:
-        return None
+    if s is None: return None
     m = re.search(r"\d+", str(s))
     return int(m.group(0)) if m else None
 
 def convert_json_to_posts(json_data: List[dict]) -> List[Dict]:
     posts = []
     for item in json_data:
-        if not isinstance(item, dict):
-            continue
+        if not isinstance(item, dict): continue
         post = {
             "number": str(item.get("mgrSeq", item.get("id", item.get("seq", "")))),
             "title": item.get("title", item.get("subject", "")),
@@ -214,8 +148,8 @@ def setup_selenium_driver_for_list(headless: bool=True):
         options.add_argument("--user-agent=" + HEADERS["User-Agent"])
         if headless:
             options.add_argument("--headless=new")
-        service = ChromeService()  # Selenium Manager 사용
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()))
+        service = ChromeService()  # Selenium Manager
+        driver = webdriver.Chrome(service=service, options=options)
         return driver
     except Exception:
         return None
@@ -238,12 +172,10 @@ def get_posts_with_selenium_from_list(debug: bool=False) -> List[Dict]:
                 if len(tds) >= 4:
                     number = row.get_attribute("key") or tds[0].text.strip()
                     title  = tds[1].text.strip()
-                    date_  = tds[2].text.strip()  # ← 목록 날짜 텍스트
+                    date_  = tds[2].text.strip()
                     views  = tds[3].text.strip()
                     if number:
-                        posts.append({
-                            "number": number, "title": title, "date": date_, "views": views, "is_new": False
-                        })
+                        posts.append({"number": number, "title": title, "date": date_, "views": views, "is_new": False})
         except Exception:
             pass
 
@@ -252,8 +184,7 @@ def get_posts_with_selenium_from_list(debug: bool=False) -> List[Dict]:
             soup = BeautifulSoup(driver.page_source, "html.parser")
             scripts = soup.find_all("script")
             for script in scripts:
-                if not script.string:
-                    continue
+                if not script.string: continue
                 for pat in [
                     r'var\s+\w*[Ll]ist\w*\s*=\s*(\[.*?\]);',
                     r'\w*[Dd]ata\w*\s*=\s*(\[.*?\]);',
@@ -268,17 +199,14 @@ def get_posts_with_selenium_from_list(debug: bool=False) -> List[Dict]:
                             break
                         except Exception:
                             continue
-                if posts:
-                    break
+                if posts: break
 
         if debug:
             print(f"[디버그] Selenium 목록 추출: {len(posts)}개")
         return posts
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        try: driver.quit()
+        except Exception: pass
 
 def get_list_posts(debug: bool=False) -> List[Dict]:
     return get_posts_with_selenium_from_list(debug=debug)
@@ -288,25 +216,20 @@ def filter_event_posts(posts: List[Dict], limit: int = 10) -> List[Dict]:
     return [p for p in head if _is_event_post(p.get("title", ""))]
 
 def select_highest_post(posts: List[Dict]) -> Optional[Dict]:
-    best = None
-    best_val = None
+    best = None; best_val = None
     for p in posts:
         iv = _to_int_or_none(p.get("number"))
-        if iv is None:
-            continue
+        if iv is None: continue
         if best is None or iv > best_val:
-            best = p
-            best_val = iv
+            best, best_val = p, iv
     return best
 
 # ---------------- 목록 날짜 → 년/월/일 파싱 ----------------
 def parse_list_date_to_ymd(date_text: str) -> Tuple[str, str, str]:
-    if not date_text:
-        return "", "", ""
+    if not date_text: return "", "", ""
     s = clean_text(date_text)
     m = re.search(r'(\d{4})\D{0,3}(\d{1,2})\D{0,3}(\d{1,2})', s)
-    if not m:
-        return "", "", ""
+    if not m: return "", "", ""
     y, mo, d = m.group(1), m.group(2), m.group(3)
     return y, f"{int(mo):02d}", f"{int(d):02d}"
 
@@ -316,28 +239,21 @@ TIME_PAT_CELL = re.compile(
 )
 
 def best_table_by_content(soup: BeautifulSoup, debug: bool=False) -> Optional[BeautifulSoup]:
-    best = None
-    best_score = (-1, -1)
+    best = None; best_score = (-1, -1)
     for table in soup.find_all("table"):
         trs = table.find_all("tr")
-        if len(trs) < 2:
-            continue
-        time_hits = 0
-        long_hits = 0
+        if len(trs) < 2: continue
+        time_hits = 0; long_hits = 0
         sample_rows = trs[1: min(len(trs), 12)]
         for tr in sample_rows:
-            cells = tr.find_all(["td", "th"])
-            if not cells:
-                continue
+            cells = tr.find_all(["td", "th"]);
+            if not cells: continue
             row_txts = [clean_text(c.get_text("\n")) for c in cells]
-            if any(TIME_PAT_CELL.search(t) for t in row_txts):
-                time_hits += 1
-            if any(len(t) >= 10 for t in row_txts):
-                long_hits += 1
+            if any(TIME_PAT_CELL.search(t) for t in row_txts): time_hits += 1
+            if any(len(t) >= 10 for t in row_txts): long_hits += 1
         score = (time_hits, long_hits)
         if score > best_score:
-            best_score = score
-            best = table
+            best_score = score; best = table
     if debug and best:
         print(f"[디버그] best_table_by_content 점수: time_hits={best_score[0]}, long_hits={best_score[1]}")
     return best
@@ -346,18 +262,15 @@ def detect_columns(table: BeautifulSoup, debug: bool=False) -> Tuple[int,int,Opt
     trs = table.find_all("tr")
     header_rows_used = 1
     for hdr_rows in [1, 2]:
-        if len(trs) < hdr_rows + 1:
-            break
+        if len(trs) < hdr_rows + 1: break
         data_cells = trs[hdr_rows].find_all(["td", "th"])
         ncols = len(data_cells) if data_cells else 0
-        if ncols == 0:
-            continue
+        if ncols == 0: continue
         col_texts = [[] for _ in range(ncols)]
         sample_rows = trs[hdr_rows: min(len(trs), hdr_rows + 15)]
         for tr in sample_rows:
             cells = tr.find_all(["td", "th"])
-            if len(cells) != ncols:
-                continue
+            if len(cells) != ncols: continue
             for j, c in enumerate(cells):
                 col_texts[j].append(clean_text(c.get_text("\n")))
         time_counts = [sum(1 for t in col_texts[j] if TIME_PAT_CELL.search(t)) for j in range(ncols)]
@@ -380,8 +293,7 @@ def detect_columns(table: BeautifulSoup, debug: bool=False) -> Tuple[int,int,Opt
     sample_rows = trs[data_start: min(len(trs), data_start + 15)]
     for tr in sample_rows:
         cells = tr.find_all(["td", "th"])
-        if len(cells) != ncols:
-            continue
+        if len(cells) != ncols: continue
         for j, c in enumerate(cells):
             col_texts[j].append(clean_text(c.get_text("\n")))
     time_counts = [sum(1 for t in col_texts[j] if TIME_PAT_CELL.search(t)) for j in range(ncols)]
@@ -397,13 +309,10 @@ def detect_columns(table: BeautifulSoup, debug: bool=False) -> Tuple[int,int,Opt
 
 def split_location_and_route(cell_text: str) -> Tuple[str, str]:
     txt = clean_text(cell_text)
-    if not txt:
-        return "", ""
+    if not txt: return "", ""
     lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
-    if not lines:
-        return txt, ""
-    place_lines: List[str] = []
-    route_lines: List[str] = []
+    if not lines: return txt, ""
+    place_lines: List[str] = []; route_lines: List[str] = []
     for ln in lines:
         if ln.startswith("※") and ("행진" in ln or "이동" in ln):
             route_lines.append(re.sub(r"^※\s*(행진|이동)\s*:\s*", "", ln))
@@ -411,7 +320,7 @@ def split_location_and_route(cell_text: str) -> Tuple[str, str]:
             place_lines.append(ln)
     tmp_place = []
     for ln in place_lines:
-        if "→" in ln or "↔" in ln or "⇄" in ln:
+        if any(ch in ln for ch in ["→","↔","⇄"]):
             route_lines.append(ln)
         else:
             tmp_place.append(ln)
@@ -419,100 +328,85 @@ def split_location_and_route(cell_text: str) -> Tuple[str, str]:
     route = normalize_spaces(" ".join(route_lines))
     return place, route
 
-def parse_table_rows(table: BeautifulSoup, debug: bool=False) -> List[Dict]:
-    trs = table.find_all("tr")
-    if len(trs) < 2:
-        return []
-    col_time, col_place, col_route, header_rows_used = detect_columns(table, debug=debug)
-    out: List[Dict] = []
-    for tr in trs[header_rows_used:]:
-        cells = tr.find_all(["td", "th"])
-        if len(cells) <= max(col_time, col_place):
-            continue
-        t_raw = clean_text(cells[col_time].get_text("\n"))
-        p_raw = clean_text(cells[col_place].get_text("\n"))
-        place, route = split_location_and_route(p_raw)
-        if not (t_raw or place or route):
-            continue
-        out.append({"시간": t_raw, "장소": place, "행진경로": route})
-    return out
-
 def parse_any(soup: BeautifulSoup, debug: bool=False) -> List[Dict]:
     soup_preprocess(soup)
     table = best_table_by_content(soup, debug=debug)
     if table:
         rows = parse_table_rows(table, debug=debug)
-        if rows:
-            return rows
+        if rows: return rows
     container = soup.select_one("#hwpEditorBoardContent, .detail_contents, .notice_contents, #contents, #container, .content")
     text = container.get_text("\n") if container else soup.get_text("\n")
     text = clean_text(text)
-    blocks = []
-    for m in TIME_PAT_CELL.finditer(text):
-        blocks.append((m.start(), m.group()))
     rows: List[Dict] = []
-    for i, (pos, tstr) in enumerate(blocks):
-        end = blocks[i+1][0] if i+1 < len(blocks) else len(text)
+    for m in TIME_PAT_CELL.finditer(text):
+        pos = m.start()
+        end = next((n.start() for n in TIME_PAT_CELL.finditer(text, pos+1)), len(text))
         body = text[pos:end]
         lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
         rem = [ln for ln in lines if not TIME_PAT_CELL.search(ln)]
-        if rem:
-            place, route = split_location_and_route("\n".join(rem))
-        else:
-            place, route = "", ""
-        rows.append({"시간": clean_text(tstr), "장소": place, "행진경로": route})
+        place, route = split_location_and_route("\n".join(rem)) if rem else ("","")
+        rows.append({"시간": clean_text(m.group()), "장소": place, "행진경로": route})
     return rows
+
+def parse_table_rows(table: BeautifulSoup, debug: bool=False) -> List[Dict]:
+    trs = table.find_all("tr")
+    if len(trs) < 2: return []
+    col_time, col_place, _col_route, header_rows_used = detect_columns(table, debug=debug)
+    out: List[Dict] = []
+    for tr in trs[header_rows_used:]:
+        cells = tr.find_all(["td", "th"])
+        if len(cells) <= max(col_time, col_place): continue
+        t_raw = clean_text(cells[col_time].get_text("\n"))
+        p_raw = clean_text(cells[col_place].get_text("\n"))
+        place, route = split_location_and_route(p_raw)
+        if not (t_raw or place or route): continue
+        out.append({"시간": t_raw, "장소": place, "행진경로": route})
+    return out
 
 def crawl(url: str, debug: bool=False, debug_html_path: Optional[Path]=None) -> List[Dict]:
     try:
         html_text = fetch_html(url)
     except requests.RequestException as e:
-        if debug:
-            print(f"[디버그] HTTP 오류: {e}")
+        if debug: print(f"[디버그] HTTP 오류: {e}")
         return []
     if debug_html_path:
         try:
             debug_html_path.parent.mkdir(parents=True, exist_ok=True)
             debug_html_path.write_text(html_text, encoding="utf-8")
-            if debug:
-                print(f"[디버그] 원본 HTML 저장: {debug_html_path}")
+            if debug: print(f"[디버그] 원본 HTML 저장: {debug_html_path}")
         except Exception as e:
-            if debug:
-                print(f"[디버그] HTML 저장 실패: {e}")
+            if debug: print(f"[디버그] HTML 저장 실패: {e}")
 
     for parser in ("lxml", "html.parser"):
         try:
             soup = BeautifulSoup(html_text, parser)
             rows = parse_any(soup, debug=debug)
-            if rows:
-                return rows
+            if rows: return rows
         except FeatureNotFound:
             continue
         except Exception as e:
-            if debug:
-                print(f"[디버그] 파싱 실패(parser={parser}): {e}")
+            if debug: print(f"[디버그] 파싱 실패(parser={parser}): {e}")
             continue
     return []
 
 # ---------------- 필터/그룹/CSV ----------------
+JONGNO_KEYWORDS = [
+    "종로구", "광화문", "광화문광장", "경복궁", "안국", "안국역", "인사동",
+    "종각", "종로", "세종문화회관", "정부서울청사", "교보빌딩", "정곡빌딩",
+    "사직로", "율곡로", "자하문로", "청와대로", "수송동", "신문로", "서린로"
+]
+
 def is_jongno_related(place: str, route: str) -> bool:
     blob = f"{place}\n{route}".lower()
     return any(kw.lower() in blob for kw in JONGNO_KEYWORDS)
 
 def filter_for_jongno(rows: List[Dict]) -> List[Dict]:
-    out = []
-    for r in rows:
-        place = r.get("장소", "")
-        route = r.get("행진경로", "")
-        if is_jongno_related(place, route):
-            out.append(r)
-    return out
+    return [r for r in rows if is_jongno_related(r.get("장소",""), r.get("행진경로",""))]
 
 def parse_time_range(t: str) -> Tuple[str, str]:
     t = clean_text(t)
     m = TIME_PAT_CELL.search(t)
-    if not m:
-        return "", ""
+    if not m: return "", ""
     sh, sm, eh, em = m.group(1), m.group(2), m.group(3), m.group(4)
     start = f"{int(sh):02d}:{int(sm):02d}"
     end = f"{int(eh):02d}:{int(em):02d}" if (eh and em) else ""
@@ -534,25 +428,18 @@ def group_rows_by_time(rows: List[Dict]) -> List[Dict]:
         key = (start, end)
         if key not in groups:
             groups[key] = {"start_time": start, "end_time": end, "places": [], "remarks": []}
-        if place:
-            groups[key]["places"].append(place)
-        if remark:
-            groups[key]["remarks"].append(remark)
-
+        if place:  groups[key]["places"].append(place)
+        if remark: groups[key]["remarks"].append(remark)
     out: List[Dict] = []
     for g in groups.values():
         g["places"] = unique_preserve_order([p for p in g["places"] if p])
         g["remarks"] = unique_preserve_order([rk for rk in g["remarks"] if rk])
         out.append(g)
-
-    def _tkey(g):
-        return (g["start_time"] or "99:99", g["end_time"] or "99:99")
-    out.sort(key=_tkey)
+    out.sort(key=lambda g: (g["start_time"] or "99:99", g["end_time"] or "99:99"))
     return out
 
 # ─────────────── 지오코딩 유틸(정규화/후보/컨텍스트) ───────────────
 GU_PATTERN = re.compile(r"(종로구|중구|용산구|성동구|광진구|동대문구|중랑구|성북구|강북구|도봉구|노원구|은평구|서대문구|마포구|양천구|강서구|구로구|금천구|영등포구|동작구|관악구|서초구|강남구|송파구|강동구)")
-
 POLICE_TO_GU = {
     "종로서": "종로구", "남대문서": "중구", "중부서": "중구", "용산서": "용산구",
     "서대문서": "서대문구", "마포서": "마포구", "영등포서": "영등포구", "동작서": "동작구",
@@ -561,24 +448,18 @@ POLICE_TO_GU = {
     "강동서": "강동구", "동대문서": "동대문구", "성북서": "성북구", "노원서": "노원구",
     "도봉서": "도봉구", "강북서": "강북구", "성동서": "성동구", "광진서": "광진구", "은평서": "은평구",
 }
-
 def extract_gu(text: str) -> Optional[str]:
-    if not text:
-        return None
+    if not text: return None
     m = GU_PATTERN.search(text)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     for k, gu in POLICE_TO_GU.items():
-        if k in text:
-            return gu
+        if k in text: return gu
     return None
 
+# 장소 정규화
 def _to_ascii_digits(s: str) -> str:
-    mapping = {
-        ord('０'): '0', ord('１'): '1', ord('２'): '2', ord('３'): '3', ord('４'): '4',
-        ord('５'): '5', ord('６'): '6', ord('７'): '7', ord('８'): '8', ord('９'): '9',
-        ord('〇'): '0',
-    }
+    mapping = {ord('０'):'0',ord('１'):'1',ord('２'):'2',ord('３'):'3',ord('４'):'4',
+               ord('５'):'5',ord('６'):'6',ord('７'):'7',ord('８'):'8',ord('９'):'9',ord('〇'):'0'}
     return s.translate(mapping)
 
 def _insert_space_between_kor_engnum(s: str) -> str:
@@ -592,38 +473,29 @@ def normalize_tokens_basic(place: str) -> str:
     t = t.replace("出口", "출구").replace("出", "출구").replace("口", "출구")
     t = _insert_space_between_kor_engnum(t)
     t = re.sub(r'(\d+)\s*(?:번)?\s*(?:출|출구)\b', r'\1번 출구', t)
-    t = re.sub(r'(\d+)\s*번\s*출구', r'\1번 출구', t)
     t = re.sub(r'\s{2,}', ' ', t).strip()
     return t
 
-# === [ADD] 장소 정제/핵심 POI 추출 ===
-WING_TOKENS = ["본관","별관","서관","동관","남관","북관","정문","후문"]
+# 노이즈/날개/알리아스/맥락
+WING_TOKENS = ["본관","별관","서관","동관","남관","북관","정문","후문","본동","신관"]
 NOISE_TOKENS = [
-    "앞","맞은편","방면","방향","인근","주변","부근","일대","일원",
-    "사거리","교차로","삼거리","부근 일대","사거리 일대"
+    "앞","옆","맞은편","방면","방향","인근","주변","부근","일대","일원","부지","앞쪽","건너편",
+    "횡단보도","교차로","사거리","오거리","분수대","계단","광장내","광장 내","인도","보도",
+    "1개차로","2개차로","3개차로","4개차로","5개차로","개차로","차로"
 ]
-
 def strip_parentheses_and_noise(s: str) -> str:
-    # 괄호류 내용 제거 & 'n개 차로' 등 제거
     s = re.sub(r"[()\[\]{}〈〉＜＞]", " ", s)
-    s = re.sub(r"\b\d+\s*개\s*차로\b", " ", s)
-    s = re.sub(r"\b\d+\s*차로\b", " ", s)
+    s = re.sub(r"\b\d+\s*개?\s*차로\b", " ", s)
     s = re.sub(r"\s{2,}", " ", s).strip()
     return s
 
 def split_core_and_wing(s: str) -> Tuple[str, List[str]]:
-    """
-    '정곡빌딩 남관 앞' -> core='정곡빌딩', wings=['남관'], 수식어 제거
-    """
     tokens = s.split()
     core_parts, wings = [], []
     for tk in tokens:
-        if tk in WING_TOKENS:
-            wings.append(tk)
-        elif tk in NOISE_TOKENS:
-            continue
-        else:
-            core_parts.append(tk)
+        if tk in WING_TOKENS: wings.append(tk)
+        elif tk in NOISE_TOKENS: continue
+        else: core_parts.append(tk)
     core = " ".join(core_parts).strip()
     return core, wings
 
@@ -631,236 +503,387 @@ def expand_wing_synonyms(wings: List[str]) -> List[str]:
     out = set()
     for w in wings:
         out.add(w)
-        if w == "남관":
-            out.update(["남문","남측 출입문"])
-        elif w == "북관":
-            out.update(["북문","북측 출입문"])
-        elif w == "동관":
-            out.update(["동문","동측 출입문"])
-        elif w == "서관":
-            out.update(["서문","서측 출입문"])
+        if w == "남관": out.update(["남문","남측 출입문"])
+        elif w == "북관": out.update(["북문","북측 출입문"])
+        elif w == "동관": out.update(["동문","동측 출입문"])
+        elif w == "서관": out.update(["서문","서측 출입문"])
+        elif w == "정문": out.update(["정문 출입구","정문 게이트"])
+        elif w == "후문": out.update(["후문 출입구","후문 게이트"])
     return list(out)
 
-def add_core_spacing_variants(name: str) -> List[str]:
-    # '정곡빌딩' ↔ '정곡 빌딩' 등
+def add_spacing_variants(name: str) -> List[str]:
     cands = {name}
-    cands.add(name.replace("빌딩", " 빌딩"))
-    cands.add(name.replace("타워", " 타워"))
+    for kw in ["빌딩","타워","센터","플라자","문고","광장","사거리","교차로","주차장","별관"]:
+        cands.add(name.replace(kw, f" {kw}"))
     return list(cands)
 
-# --- [REPLACE] 후보 질의 생성기: build_query_candidates ---
-def build_query_candidates(place: str, remark: str) -> List[str]:
-    # 1) 기본 정규화 + 괄호/차로수 등 노이즈 제거
+ALIAS_MAP: List[Tuple[re.Pattern, str]] = [
+    (re.compile(r"정\s*곡\s*빌\s*딩"), "정부서울청사 별관 정곡빌딩"),
+    (re.compile(r"정부\s*서울\s*청사"), "정부서울청사"),
+    (re.compile(r"교\s*보\s*빌\s*딩"), "교보생명빌딩 광화문"),
+    (re.compile(r"교\s*보\s*문\s*고"), "교보문고 광화문점"),
+    (re.compile(r"광\s*화\s*문\s*광\s*장"), "광화문광장"),
+    (re.compile(r"세\s*종\s*문\s*화\s*회\s*관"), "세종문화회관"),
+    (re.compile(r"경\s*복\s*궁"), "경복궁"),
+    (re.compile(r"광\s*화\s*문\b"), "광화문"),
+]
+def apply_aliases(name: str) -> List[str]:
+    outs = [name]
+    for pat, rep in ALIAS_MAP:
+        if pat.search(name):
+            outs.append(rep)
+    return unique_preserve_order([normalize_spaces(x) for x in outs if x])
+
+CTX_PATTERNS = [
+    r"[가-힣A-Za-z0-9]+(?:대로|로|길)\b",               # 세종대로, 사직로, 종로, 율곡로, 서린로 ...
+    r"[가-힣A-Za-z0-9]+광장\b",                        # 광화문광장
+    r"[가-힣A-Za-z0-9]+문\b",                          # 광화문
+    r"[가-힣A-Za-z0-9]+궁\b",                          # 경복궁
+    r"(?:정부서울청사|[가-힣A-Za-z0-9]+시청)\b",        # 정부서울청사, 시청
+    r"[가-힣A-Za-z0-9]+역\b(?:\s*\d+\s*번\s*출구)?",     # 종각역 4번 출구
+    r"[가-힣A-Za-z0-9]+사거리\b|[가-힣A-Za-z0-9]+교차로\b"
+]
+def extract_context_terms(text: str, limit: int = 3) -> List[str]:
+    if not text: return []
+    found = []
+    for pat in CTX_PATTERNS:
+        for m in re.finditer(pat, text):
+            tok = normalize_spaces(m.group(0))
+            if tok and tok not in found:
+                found.append(tok)
+    key_prio = ["광화문", "광화문광장", "세종대로", "사직로", "종로", "경복궁", "시청", "정부서울청사"]
+    found.sort(key=lambda x: (0 if any(k in x for k in key_prio) else 1, len(x)))
+    return found[:limit]
+
+# 후보 질의 생성
+def build_query_candidates(place: str, remarks_joined: str) -> Tuple[List[str], str, List[str]]:
     base0 = normalize_tokens_basic(place)
     base1 = strip_parentheses_and_noise(base0)
 
-    # 2) 핵심 POI와 동/서/남/북/본/별관 등 분리
     core, wings = split_core_and_wing(base1)
     wing_syns = expand_wing_synonyms(wings)
+    core_vars = add_spacing_variants(core) if core else []
+    base_vars = add_spacing_variants(base1) if base1 else []
 
-    # 3) 코어 명칭의 띄어쓰기/표기 변형
-    core_vars = add_core_spacing_variants(core) if core else []
-    # base 변형도 일부 유지
-    base_vars = add_core_spacing_variants(base1) if base1 else []
+    alias_vars = []
+    for nm in unique_preserve_order([core] + core_vars + [base1] + base_vars):
+        alias_vars.extend(apply_aliases(nm))
+    alias_vars = unique_preserve_order(alias_vars)
 
-    # 4) 기본 후보(코어 우선) 구성
+    gu = extract_gu(f"{place} {remarks_joined}")
+    ctx_terms = extract_context_terms(remarks_joined)
+
     cand: List[str] = []
     seen = set()
+    def add(q: str):
+        q = normalize_spaces(q)
+        if not q or q in seen: return
+        seen.add(q); cand.append(q)
 
-    def add(x: str):
-        xx = x.strip()
-        if not xx or xx in seen:
-            return
-        seen.add(xx); cand.append(xx)
-
-    for cv in core_vars or []:
+    # 1) 코어 우선
+    for cv in (core_vars or []):
         add(cv)
-        for w in wings:
-            add(f"{cv} {w}")
-        for w in wing_syns:
-            add(f"{cv} {w}")
+        for w in wings: add(f"{cv} {w}")
+        for w in wing_syns: add(f"{cv} {w}")
 
-    if base1:
-        add(base1)
-        for v in base_vars:
-            add(v)
+    # 2) 알리아스(강력) → 앞쪽
+    for v in alias_vars:
+        add(v)
 
-    # "역 2번 출구" 패턴 유지
-    m = re.search(r'(.*?역)\s*(\d+)\s*번\s*출구', base1)
-    if m:
-        st, num = m.group(1).strip(), m.group(2)
-        for v in [f"{st} {num}번 출구", f"{st} {num}번출구", f"{st} {num} 출구", st]:
-            add(v)
+    # 3) 베이스 변형
+    if base1: add(base1)
+    for v in base_vars: add(v)
 
-    # 5) 구 힌트/서울 접두어
-    gu = extract_gu(f"{place} {remark}")  # 장소/비고에서 구 추정
+    # 4) 맥락 결합 (강한 조합을 앞에)
+    pref = []
+    for q in list(cand):
+        for ctx in ctx_terms:
+            pref.append(f"{q} {ctx}")
+    cand = unique_preserve_order(pref + cand)
+
+    # 5) 서울/구 접두 (최우선)
     prefixes = []
     if gu: prefixes.append(f"서울 {gu}")
     prefixes.append("서울")
+    front = []
+    for pfx in prefixes:
+        for q in cand[:20]:  # 상위 후보만 접두
+            front.append(f"{pfx} {q}")
 
-    expanded = []
-    for q in cand:
-        expanded.append(q)
-        for pfx in prefixes:
-            expanded.append(f"{pfx} {q}")
+    final = unique_preserve_order(front + cand)[:50]
+    return final, (core or ""), ctx_terms
 
-    # 6) 중복 제거
-    out, seen2 = [], set()
-    for q in expanded:
-        q2 = re.sub(r'\s{2,}', ' ', q).strip()
-        if q2 and q2 not in seen2:
-            seen2.add(q2); out.append(q2)
+# ----- 디버그용: VWorld 검색 결과 미리보기 -----
+def _debug_preview_items(items: list, max_k: int = 3) -> str:
+    outs = []
+    for i, it in enumerate(items[:max_k], 1):
+        title = str(it.get("title",""))
+        addr  = f"{it.get('address','')} {it.get('road_address','')}".strip()
+        pt    = it.get("point") or {}
+        x, y  = pt.get("x"), pt.get("y")
+        if (x is None or y is None) and isinstance((it.get("geometry") or {}).get("coordinates"), list):
+            coords = it["geometry"]["coordinates"]
+            if len(coords) >= 2:
+                x, y = coords[0], coords[1]
+        outs.append(f"  · #{i} title='{title}' / addr='{addr}' / (y,x)=({y},{x})")
+    return "\n".join(outs) if outs else "  · (후보 없음)"
 
-    return out
-
-# === [ADD] VWorld 결과 스코어링 선택 ===
-def _choose_best_item(items: list, gu_hint: Optional[str], needle: Optional[str]) -> Optional[dict]:
-    """
-    VWorld place 검색 결과 중에서 서울/구 힌트/키워드 일치도를 점수화하여 최적 후보 선택
-    """
-    if not items:
-        return None
-
-    def score(it: dict) -> int:
-        s = json.dumps(it, ensure_ascii=False).lower()
-        sc = 0
-        if '서울' in s: sc += 2
-        if '종로' in s: sc += 2
-        if gu_hint and gu_hint.lower() in s: sc += 3
-        if needle and needle.lower() in s: sc += 2  # 키워드(핵심 POI) 매칭
-        title = str(it.get('title','')).lower()
-        if needle and needle.lower() in title:
-            sc += 3
-        return sc
-
-    items_sorted = sorted(items, key=lambda x: score(x), reverse=True)
-    return items_sorted[0]
-
-# --- [REPLACE] VWorld place 검색(확장+스코어링) ---
-def _vworld_search_place(query: str, key: str, session: requests.Session,
-                         gu_hint: Optional[str] = None,
-                         needle: Optional[str] = None) -> Optional[Tuple[float, float]]:
-    params = {
-        "service": "search", "request": "search", "version": "2.0", "format": "json",
-        "size": 10,  # 더 넉넉히
-        "page": 1, "type": "place", "query": query, "key": key
-    }
-    try:
+# PLACE 다중 페이지 조회
+def _vworld_search_place(query: str, key: str, session: requests.Session, debug: bool=False) -> List[dict]:
+    items_all = []
+    for page in (1, 2):  # 1~2페이지만
+        params = {
+            "service": "search", "request": "search", "version": "2.0", "format": "json",
+            "size": 30, "page": page, "type": "place", "key": key, "query": query
+        }
+        if debug:
+            print(f"[VWorld PLACE] GET {VWORLD_SEARCH_URL} page={page} query='{query}'")
         r = session.get(VWORLD_SEARCH_URL, params=params, timeout=8)
-        if r.status_code != 200:
-            return None
+        r.raise_for_status()
         data = r.json()
         items = (((data or {}).get("response") or {}).get("result") or {}).get("items", [])
-        if not isinstance(items, list) or not items:
-            return None
+        if items:
+            items_all.extend(items)
+        if not items or len(items) < 30:
+            break
+    if debug:
+        print(f"[VWorld PLACE]  → 후보 {len(items_all)}개\n{_debug_preview_items(items_all)}")
+    return items_all
 
-        best = _choose_best_item(items, gu_hint, needle) or items[0]
-        pt = (best.get("point") or {})
+def _vworld_address_coord(addr: str, key: str, session: requests.Session, addr_type: str, debug: bool=False) -> Optional[Tuple[float, float]]:
+    params = {"service":"address","request":"getCoord","version":"2.0","format":"json","crs":"EPSG:4326","type":addr_type,"address":addr,"key":key}
+    if debug:
+        print(f"[VWorld ADDR] GET {VWORLD_ADDR_URL} type={addr_type} addr='{addr}'")
+    r = session.get(VWORLD_ADDR_URL, params=params, timeout=6)
+    r.raise_for_status()
+    data = r.json()
+    res = (data.get("response") or {}).get("result")
+    if isinstance(res, list):
+        res = res[0] if res else None
+    if not isinstance(res, dict):
+        if debug: print("[VWorld ADDR]  → 결과 없음")
+        return None
+    pt = res.get("point") or {}
+    x, y = pt.get("x"), pt.get("y")
+    if x is None or y is None:
+        if debug: print("[VWorld ADDR]  → 좌표 없음")
+        return None
+    if debug:
+        print(f"[VWorld ADDR]  → (y,x)=({y},{x})")
+    return (float(y), float(x))
+
+# 스코어링 + BBOX 반영
+def _choose_best_item(items: list, gu_hint: Optional[str], needle: Optional[str],
+                      ctx_terms: List[str],
+                      bbox: Optional[Tuple[float,float,float,float]] = None,
+                      bbox_mode: str = "boost") -> Optional[dict]:
+    if not items: return None
+
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", "", (s or "").lower())
+
+    needle_n = _norm(needle or "")
+    def core_match_score(title: str) -> int:
+        if not needle_n: return 0
+        t = _norm(title)
+        if needle_n and needle_n == t:  # 완전 일치
+            return 6
+        if needle_n and needle_n in t:  # 부분 포함
+            return 3
+        return 0
+
+    def get_xy(it: dict) -> Tuple[Optional[float], Optional[float]]:
+        pt = it.get("point") or {}
         x, y = pt.get("x"), pt.get("y")
         if x is None or y is None:
-            coords = ((best.get("geometry") or {}).get("coordinates"))
+            coords = ((it.get("geometry") or {}).get("coordinates"))
             if isinstance(coords, list) and len(coords) >= 2:
                 x, y = coords[0], coords[1]
-        if x is None or y is None:
-            return None
-        lon = float(x); lat = float(y)
-        return (lat, lon)
-    except requests.RequestException:
-        return None
-    except Exception:
-        return None
+        return (float(x) if x is not None else None,
+                float(y) if y is not None else None)
 
-def _vworld_address_coord(addr: str, key: str, session: requests.Session, addr_type: str) -> Optional[Tuple[float, float]]:
-    params = {
-        "service": "address", "request": "getCoord", "version": "2.0", "format": "json",
-        "crs": "EPSG:4326", "type": addr_type, "address": addr, "key": key
-    }
-    try:
-        r = session.get(VWORLD_ADDR_URL, params=params, timeout=6)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        res = (data.get("response") or {}).get("result") or {}
-        pt = (res.get("point") or {})
-        x, y = pt.get("x"), pt.get("y")
-        if x is None or y is None:
-            return None
-        lon = float(x); lat = float(y)
-        return (lat, lon)
-    except requests.RequestException:
-        return None
-    except Exception:
-        return None
+    def score(it: dict) -> int:
+        s_all = json.dumps(it, ensure_ascii=False)
+        s = s_all.lower()
+        sc = 0
+        if '서울' in s: sc += 3
+        if gu_hint and gu_hint.lower() in s: sc += 4
 
-# --- [REPLACE] geocode_vworld: 힌트 전달 가능 ---
-def geocode_vworld(query: str, key: str, session: requests.Session,
-                   gu_hint: Optional[str] = None,
-                   needle: Optional[str] = None) -> Optional[Tuple[float, float]]:
-    q = (query or "").strip()
-    if not q:
-        return None
-    hit = _vworld_search_place(q, key, session, gu_hint=gu_hint, needle=needle)
-    if hit: return hit
-    hit = _vworld_address_coord(q, key, session, "road")
-    if hit: return hit
-    return _vworld_address_coord(q, key, session, "parcel")
+        title = str(it.get('title',''))
+        addr  = f"{it.get('address','')} {it.get('road_address','')}".lower()
+        if "서울" in addr or "seoul" in addr: sc += 2
+        else: sc -= 1
 
-# --- [REPLACE] geocode_grouped_inplace: 힌트 전달/캐시/속도제어 ---
-def geocode_grouped_inplace(grouped: List[Dict], vworld_key: str, sleep_sec: float = 0.15):
+        sc += core_match_score(title)
+        for ctx in ctx_terms:
+            c = ctx.lower()
+            if c in title.lower() or c in addr:
+                sc += 2
+
+        for k in ["광화문","세종대로","종로","정부서울청사","교보","세종문화회관","경복궁","안국","종각"]:
+            if k in s: sc += 1
+
+        # BBOX 가중치/페널티
+        x, y = get_xy(it)
+        if x is not None and y is not None and bbox:
+            lat, lon = y, x
+            inside = _in_bbox(lat, lon, bbox)
+            if bbox_mode == "boost":
+                sc += (5 if inside else -5)
+            elif bbox_mode == "strict":
+                sc += (100 if inside else -100)
+        return sc
+
+    ranked = sorted(items, key=score, reverse=True)
+
+    # bbox 주어진 경우, 상위권에서 박스 내 첫 후보를 우선 리턴
+    if bbox and bbox_mode in ("boost","strict"):
+        for it in ranked[:20]:
+            pt = it.get("point") or {}
+            x, y = pt.get("x"), pt.get("y")
+            if x is None or y is None:
+                coords = ((it.get("geometry") or {}).get("coordinates"))
+                if isinstance(coords, list) and len(coords) >= 2:
+                    x, y = coords[0], coords[1]
+            if x is not None and y is not None and _in_bbox(float(y), float(x), bbox):
+                return it
+
+    return ranked[0] if ranked else None
+
+def geocode_vworld_candidates(queries: List[str], key: str, session: requests.Session,
+                              gu_hint: Optional[str], needle: Optional[str],
+                              ctx_terms: List[str],
+                              bbox: Optional[Tuple[float,float,float,float]] = None,
+                              bbox_mode: str = "boost",
+                              debug: bool=False) -> Optional[Tuple[float,float,str]]:
+    """
+    질의 리스트를 순차 시도 → PLACE 스코어링 최적 후보 → 좌표 반환.
+    실패시 ADDRESS(road→parcel) 시도. 성공 시 (lat,lon,사용쿼리) 반환.
+    마지막으로 맥락 단독 재시도.
+    """
+    # 1) PLACE
+    for q in queries:
+        try:
+            items = _vworld_search_place(q, key, session, debug=debug)
+        except Exception as e:
+            if debug: print(f"[VWorld PLACE] 오류: {e}")
+            items = []
+        if items:
+            best = _choose_best_item(items, gu_hint, needle, ctx_terms, bbox=bbox, bbox_mode=bbox_mode) or items[0]
+            pt = best.get("point") or {}
+            x, y = pt.get("x"), pt.get("y")
+            if x is None or y is None:
+                coords = ((best.get("geometry") or {}).get("coordinates"))
+                if isinstance(coords, list) and len(coords) >= 2:
+                    x, y = coords[0], coords[1]
+            if x is not None and y is not None:
+                return (float(y), float(x), q)
+        # 다음 후보로
+
+    # 2) ADDRESS 보강 (bbox 검증 포함)
+    addr_try = []
+    for q in queries[:4]:
+        if gu_hint:
+            addr_try.append(f"서울 {gu_hint} {q}")
+        addr_try.append(f"서울 {q}")
+    addr_try += queries[:2]
+    for a in addr_try:
+        got = _vworld_address_coord(a, key, session, "road", debug=debug)
+        if got:
+            if (not bbox) or (bbox_mode == "boost" and _in_bbox(got[0], got[1], bbox)) or \
+               (bbox_mode == "strict" and _in_bbox(got[0], got[1], bbox)):
+                return (got[0], got[1], a)
+        got = _vworld_address_coord(a, key, session, "parcel", debug=debug)
+        if got:
+            if (not bbox) or (bbox_mode == "boost" and _in_bbox(got[0], got[1], bbox)) or \
+               (bbox_mode == "strict" and _in_bbox(got[0], got[1], bbox)):
+                return (got[0], got[1], a)
+
+    # 3) 최후 수단(맥락 단독)
+    if ctx_terms:
+        for ctx in ctx_terms:
+            try:
+                q2 = f"서울 {gu_hint or ''} {ctx}".strip()
+                items = _vworld_search_place(q2, key, session, debug=debug)
+            except Exception as e:
+                if debug: print(f"[VWorld PLACE/CTX] 오류: {e}")
+                items = []
+            if items:
+                best = _choose_best_item(items, gu_hint, needle, ctx_terms, bbox=bbox, bbox_mode=bbox_mode) or items[0]
+                pt = best.get("point") or {}
+                x, y = pt.get("x"), pt.get("y")
+                if x is None or y is None:
+                    coords = ((best.get("geometry") or {}).get("coordinates"))
+                    if isinstance(coords, list) and len(coords) >= 2:
+                        x, y = coords[0], coords[1]
+                if x is not None and y is not None:
+                    return (float(y), float(x), f"[CTX]{ctx}")
+
+    return None
+
+# --- 그룹 지오코딩 (강화판) ---
+def geocode_grouped_inplace(grouped: List[Dict], vworld_key: str,
+                            sleep_sec: float = 0.25,
+                            bbox: Optional[Tuple[float,float,float,float]] = None,
+                            bbox_mode: str = "boost",
+                            debug: bool=False):
     session = requests.Session()
     cache: Dict[str, Optional[Tuple[float, float]]] = {}
     for g in grouped:
         places = g.get("places", []) or []
         remark_context = " | ".join(g.get("remarks", []) or [])
-        # 구 힌트 추출
         gu_hint = extract_gu(f"{' '.join(places)} {remark_context}")
-        lats: List[Optional[float]] = []
-        lons: List[Optional[float]] = []
+        lats: List[Optional[float]] = []; lons: List[Optional[float]] = []
         for p in places:
-            # 코어 키워드(needle) 산출
-            core_, _w_ = split_core_and_wing(strip_parentheses_and_noise(normalize_tokens_basic(str(p or ""))))
-            candidates = build_query_candidates(str(p or ""), remark_context)
-            hit: Optional[Tuple[float, float]] = None
-            for q in candidates:
+            queries, core_kw, ctx_terms = build_query_candidates(str(p or ""), remark_context)
+
+            if debug:
+                print("\n[지오코딩 시작]")
+                print(f"  · 장소: '{p}'")
+                print(f"  · 구 힌트: '{gu_hint or ''}', 코어: '{core_kw}', 맥락: {ctx_terms}")
+                print(f"  · 질의 후보({len(queries)}): {queries[:12]}{' ...' if len(queries)>12 else ''}")
+
+            hit = None; used_q = None
+            # 캐시 우선
+            for q in queries:
                 if q in cache:
                     hit = cache[q]
-                else:
-                    hit = geocode_vworld(q, vworld_key, session, gu_hint=gu_hint, needle=core_ or None)
+                    if hit:
+                        used_q = q
+                        if debug:
+                            print(f"[캐시적중] '{p}' → (lat,lon)={hit} via '{q}'")
+                        break
+            # API 호출
+            if not hit:
+                got = geocode_vworld_candidates(
+                    queries, vworld_key, session,
+                    gu_hint, core_kw or None, ctx_terms,
+                    bbox=bbox, bbox_mode=bbox_mode, debug=debug
+                )
+                if got:
+                    lat, lon, used_q = got
+                    hit = (lat, lon)
+                # 캐시 저장(앞쪽 후보 위주)
+                for q in queries[:8]:
                     cache[q] = hit
-                    time.sleep(sleep_sec)
-                if hit:
-                    break
-            if hit:
-                lat, lon = hit
-                lats.append(lat); lons.append(lon)
-            else:
-                lats.append(None); lons.append(None)
-        g["lats"] = lats
-        g["lons"] = lons
+                time.sleep(max(0.0, float(sleep_sec)))
+            if debug:
+                if hit: print(f"[지오코딩 성공] '{p}' → (lat,lon)={hit}  (사용질의='{used_q}')")
+                else:   print(f"[지오코딩 실패] '{p}' (질의 {len(queries)}개 시도)")
+            lats.append(hit[0] if hit else None)
+            lons.append(hit[1] if hit else None)
+        g["lats"] = lats; g["lons"] = lons
 
 # ---------------- CSV 렌더링 ----------------
 def records_to_csv_rows(ymd: Optional[Tuple[str, str, str]], grouped: List[Dict]) -> List[Dict]:
-    """
-    최종 CSV 행으로 변환:
-      ['년','월','일','start_time','end_time','장소','인원','위도','경도','비고']
-    - 장소/위도/경도는 JSON 문자열
-    - 지오코딩이 수행되지 않은 경우 위도/경도는 "[]"
-    """
     if ymd is not None:
         Y, M, D = ymd
     else:
         Y = M = D = ""
-
     rows_csv: List[Dict] = []
     for g in grouped:
-        places = g.get("places", [])
-        places_json = json.dumps(places, ensure_ascii=False)
-        if "lats" in g and "lons" in g:
-            lat_list = g["lats"]
-            lon_list = g["lons"]
-        else:
-            lat_list = []
-            lon_list = []
+        places_json = json.dumps(g.get("places", []), ensure_ascii=False)
+        lat_list = g.get("lats", []); lon_list = g.get("lons", [])
         lats_json = json.dumps(lat_list, ensure_ascii=False)
         lons_json = json.dumps(lon_list, ensure_ascii=False)
         remarks = " | ".join(g.get("remarks", []))
@@ -886,52 +909,50 @@ def save_csv_new_schema(records: List[Dict], out_path: str):
 
 # ---------------- 메인 ----------------
 def main():
-    p = argparse.ArgumentParser(description="SPATIC 집회·통제정보 크롤러 (Selenium 목록 기반 / 새 CSV 스키마 / VWorld 지오코딩)")
+    p = argparse.ArgumentParser(description="SPATIC 집회·통제정보 크롤러 (Selenium 목록 기반 / CSV / VWorld 지오코딩+BBOX 강화)")
     p.add_argument("--url", help="게시글 URL 직접 지정 (지정 시 mgrSeq/목록 무시)")
     p.add_argument("--mgr-seq", type=int, help="mgrSeq 직접 지정 (예: 1177)")
-    p.add_argument("--out", default="data/집회_정보.csv", help="저장 CSV 경로 (기본: data/집회_정보.csv)")
-    p.add_argument("--debug", action="store_true", help="파싱/선택 근거 로그 출력")
+    p.add_argument("--out", default="집회_정보.csv", help="저장 CSV 경로 (기본: 집회_정보.csv)")
+    p.add_argument("--debug", action="store_true", help="파싱/지오코딩 로그 출력")
     p.add_argument("--debug-html", action="store_true", help="원본 HTML을 debug/ 폴더에 저장")
     p.add_argument("--vworld-key", default=None, help="VWorld API Key (기본: 환경변수 VWORLD_KEY 또는 내장 기본키)")
-    p.add_argument("--rate", type=float, default=0.15, help="지오코딩 호출 간 대기(초), 기본 0.15")
+    p.add_argument("--rate", type=float, default=0.25, help="지오코딩 호출 간 대기(초)")
+    # BBOX 옵션
+    p.add_argument("--bbox", choices=list(BBOXES.keys()), default="jj_loose",
+                   help="후보 좌표 가중/필터에 사용할 BBOX (기본: jj_loose)")
+    p.add_argument("--bbox-mode", choices=["boost","strict"], default="boost",
+                   help="BBOX 적용 방식: boost=가중치, strict=박스 밖 후보 배제")
     args = p.parse_args()
 
     # 키 우선순위: --vworld-key > 환경변수 > DEFAULT_VWORLD_KEY
-    env_key = None
     try:
-        import os
-        env_key = os.environ.get("VWORLD_KEY")
+        env_key = __import__("os").environ.get("VWORLD_KEY")
     except Exception:
         env_key = None
     vworld_key = args.vworld_key or env_key or DEFAULT_VWORLD_KEY
 
     chosen_url: Optional[str] = None
-    chosen_post: Optional[Dict] = None   # number/title/date/...
+    chosen_post: Optional[Dict] = None
 
-    # 우선순위: --url > --mgr-seq > (Selenium) 목록 기반 자동 선택
+    # 우선순위: --url > --mgr-seq > (Selenium) 목록 기반
     if args.url:
         chosen_url = args.url
-        if args.debug:
-            print(f"[정보] 요청 URL: {chosen_url} (URL 직접 지정)")
+        if args.debug: print(f"[정보] 요청 URL: {chosen_url} (URL 직접 지정)")
         rows = crawl(chosen_url, debug=args.debug,
                      debug_html_path=(Path("debug") / "manual_url.html") if args.debug_html else None)
-        ymd = None  # 목록을 보지 않았으므로 날짜는 공란
-
+        ymd = None
     elif args.mgr_seq is not None:
         chosen_url = DETAIL_URL_FMT.format(mgrSeq=args.mgr_seq)
-        if args.debug:
-            print(f"[정보] 요청 URL: {chosen_url} (mgrSeq 직접 지정: {args.mgr_seq})")
+        if args.debug: print(f"[정보] 요청 URL: {chosen_url} (mgrSeq 직접 지정: {args.mgr_seq})")
         rows = crawl(chosen_url, debug=args.debug,
                      debug_html_path=(Path("debug") / f"mgrseq_{args.mgr_seq}.html") if args.debug_html else None)
-        ymd = None  # 목록을 보지 않았으므로 날짜는 공란
-
+        ymd = None
     else:
         if not SELENIUM_AVAILABLE:
             print("[오류] Selenium을 사용할 수 없습니다. --mgr-seq 또는 --url 옵션을 지정해 주세요.")
             return
         posts = get_list_posts(debug=args.debug)
-        if args.debug:
-            print(f"[디버그] 목록 총 {len(posts)}건 수집")
+        if args.debug: print(f"[디버그] 목록 총 {len(posts)}건 수집")
         event_posts = filter_event_posts(posts, limit=10)
         if args.debug:
             for i, p_ in enumerate(event_posts, 1):
@@ -947,7 +968,6 @@ def main():
                      debug_html_path=(Path("debug") / f"list_{chosen_post['number']}.html") if args.debug_html else None)
         ymd = parse_list_date_to_ymd(chosen_post.get("date", ""))
 
-    # 결과 처리
     if not chosen_url:
         print("[오류] 유효한 게시글 URL을 결정하지 못했습니다.")
         return
@@ -956,38 +976,31 @@ def main():
     rows_filtered = filter_for_jongno(rows)
     # 2) 시간대 그룹핑
     grouped = group_rows_by_time(rows_filtered)
-    # 3) 지오코딩 (장소 수만큼 [lat], [lon] 리스트 생성; 실패 None→CSV에서는 null)
+
+    # 3) 지오코딩
+    bbox = BBOXES[args.bbox]
+    bbox_mode = args.bbox_mode
     if vworld_key:
         if args.debug:
             tail = ('***' + vworld_key[-6:]) if len(vworld_key or '') > 6 else '***'
-            print(f"[정보] VWorld 지오코딩 시행 (rate={args.rate}s, key={tail})")
-        geocode_grouped_inplace(grouped, vworld_key, args.rate)
+            print(f"[정보] VWorld 지오코딩 시행 (rate={args.rate}s, key={tail}, bbox={args.bbox}, mode={bbox_mode})")
+        geocode_grouped_inplace(grouped, vworld_key, args.rate, bbox=bbox, bbox_mode=bbox_mode, debug=args.debug)
     else:
         if args.debug:
             print("[경고] VWorld 키가 없어 지오코딩을 건너뜁니다. --vworld-key 또는 환경변수 설정 필요.")
 
     # 4) CSV 저장
+    save_dir = Path("data")
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = Path(args.out).name   # 파일명만 추출
+    out_path = save_dir / filename
+
     final_records = records_to_csv_rows(ymd, grouped)
+    save_csv_new_schema(final_records, str(out_path))
 
-    # --- 파일명: 집회 날짜 기준 ---
-    if ymd and all(ymd):
-        date_str = f"{ymd[0]}-{ymd[1]}-{ymd[2]}"
-    else:
-        date_str = datetime.now().strftime("%Y-%m-%d")
-
-    out_path = Path(f"data/집회_정보_{date_str}.csv")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # --- 기존 파일이 있으면 병합 ---
-    existing = load_csv(str(out_path))
-    merged = merge_records(existing, final_records)
-    save_csv(merged, str(out_path))
-
-    print(
-        f"[완료] {out_path} 저장 "
-        f"(총 {len(merged)}건, 종로구 필터 적용 / 선택 URL={chosen_url}"
-        f" / 날짜={date_str})"
-    )
+    ymd_str = "-".join(ymd) if ymd and all(ymd) else ""
+    print(f"[완료] {out_path} 저장 (총 {len(final_records)}건, 종로구 필터 적용 / 선택 URL={chosen_url}{' / 날짜=' + ymd_str if ymd_str else ''})")
 
 if __name__ == "__main__":
     main()

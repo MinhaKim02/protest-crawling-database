@@ -7,3 +7,4 @@ pandas
 FastAPI
 uvicorn
 pdfminer.six
+python-dateutil

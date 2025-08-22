@@ -23,9 +23,7 @@ import time
 import argparse
 import pathlib
 import urllib.parse
-import datetime
 from typing import List, Dict, Optional, Tuple, Any
-import pandas as pd
 
 import requests
 from bs4 import BeautifulSoup
@@ -42,7 +40,7 @@ except Exception:
 # ──────────────────────────────────────────────────────────────────────
 # SMPA(서울경찰청) 목록/첨부 PDF 다운로드
 BASE = "https://www.smpa.go.kr"
-LIST_URL = f"{BASE}/user/nd54882.do" # 서울경찰청 > 오늘의 집회
+LIST_URL = f"{BASE}/user/nd54882.do"  # 서울경찰청 > 오늘의 집회
 
 
 def ensure_dir(p: str):
@@ -659,38 +657,6 @@ def write_csv(rows: List[Dict[str, str]], out_path: str) -> None:
         for r in rows:
             w.writerow(r)
 
-def merge_and_save_csv(rows: List[Dict[str, str]], out_path: str) -> None:
-    """기존 CSV가 있으면 병합/보강, 없으면 새로 생성"""
-    fields = ["년","월","일","start_time","end_time","장소","인원","위도","경도","비고"]
-    ensure_dir(os.path.dirname(out_path) or ".")
-
-    new_df = pd.DataFrame(rows, columns=fields).fillna("")
-
-    if os.path.exists(out_path):
-        old_df = pd.read_csv(out_path, dtype=str).fillna("")
-
-        for _, new_row in new_df.iterrows():
-            matched = False
-            for idx, old_row in old_df.iterrows():
-                if (old_row["start_time"] == new_row["start_time"] and
-                    old_row["end_time"] == new_row["end_time"] and
-                    old_row["장소"] == new_row["장소"]):
-                    matched = True
-                    # 보강: 기존에 비어 있으면 새 데이터로 채움
-                    for col in fields:
-                        if old_row[col] == "" and new_row[col] != "":
-                            old_df.at[idx, col] = new_row[col]
-                    break
-            if not matched:
-                old_df = pd.concat([old_df, pd.DataFrame([new_row])], ignore_index=True)
-
-        final_df = old_df
-    else:
-        final_df = new_df
-
-    final_df.to_csv(out_path, index=False, encoding="utf-8-sig")
-    print(f"💾 CSV 저장 완료: {out_path} (총 {len(final_df)}행)")
-    
 # ──────────────────────────────────────────────────────────────────────
 # 실행부
 def main():
@@ -733,24 +699,27 @@ def main():
     else:
         print("ℹ️ VWorld 키가 없어 지오코딩을 건너뜁니다. --vworld-key 또는 환경변수 VWORLD_KEY를 지정하세요.")
 
-    # 집회 날짜 기반 파일명
-    if ymd:
-        date_str = f"{ymd[0]}-{ymd[1]}-{ymd[2]}"
-    else:
-        date_str = datetime.now().strftime("%Y-%m-%d")
+    # 저장 경로(전체/종로)
+    # 저장 경로(전체/종로)
+    save_dir = os.path.join(os.getcwd(), "data")   # 프로젝트 루트의 data 폴더
+    ensure_dir(save_dir)
 
-    ensure_dir("data")
-    out_all = os.path.join("data", f"집회_정보_{date_str}.csv")
-    out_jongno = os.path.join("data", f"집회_정보_{date_str}_종로.csv")
+    if args.out:
+        filename = os.path.basename(args.out)      # 파일명만 가져오기
+        out_all = os.path.join(save_dir, filename)
+    else:
+        out_all = os.path.join(save_dir, "집회정보_통합.csv")
+
+    root, ext = os.path.splitext(out_all)
+    out_jongno = f"{root}_종로{ext or '.csv'}"
 
     # 저장
-    merge_and_save_csv(rows, out_all)
+    write_csv(rows, out_all)
     rows_jongno = filter_rows_jongno(rows)
-    merge_and_save_csv(rows_jongno, out_jongno)
+    write_csv(rows_jongno, out_jongno)
 
     print(f"[완료] 전체 CSV 저장: {out_all} (총 {len(rows)}행)")
     print(f"[완료] 종로 필터 CSV 저장: {out_jongno} (총 {len(rows_jongno)}행)")
-
 
 if __name__ == "__main__":
     main()
