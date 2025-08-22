@@ -1,6 +1,9 @@
 requests
 beautifulsoup4
 selenium
+webdriver-manager
+lxml
 pandas
 FastAPI
 uvicorn
+pdfminer.six
