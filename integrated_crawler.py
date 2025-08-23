@@ -24,6 +24,8 @@ import argparse
 import pathlib
 import urllib.parse
 from typing import List, Dict, Optional, Tuple, Any
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo  # Python 3.9+ 표준
 
 import requests
 from bs4 import BeautifulSoup
@@ -66,13 +68,12 @@ def filename_from_cd(cd: str) -> Optional[str]:
         return m2.group(1).strip()
     return None
 
-
 def _current_title_pattern() -> Tuple[str, str]:
     # 예) "오늘의 집회 250822 금"
-    from datetime import datetime
-    current_date = datetime.now().strftime("%y%m%d")
+    now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+    current_date = now_kst.strftime("%y%m%d")
     weekdays = ["월", "화", "수", "목", "금", "토", "일"]
-    current_day = weekdays[datetime.now().weekday()]
+    current_day = weekdays[now_kst.weekday()]
     return current_date, f"오늘의 집회 {current_date} {current_day}"
 
 
@@ -104,6 +105,15 @@ def extract_ymd_from_title(title: str) -> Optional[Tuple[str, str, str]]:
     yyyy = f"20{yy}"
     return (yyyy, mm, dd)
 
+def _y6_to_date(y6: Optional[str]) -> Optional[datetime]:
+    if not y6:
+        return None
+    try:
+        # 반환값은 타임존 포함 KST 자정으로 맞춤
+        d = datetime.strptime(y6, "%y%m%d").date()
+        return datetime(d.year, d.month, d.day, tzinfo=ZoneInfo("Asia/Seoul"))
+    except Exception:
+        return None
 
 def get_today_post_info(session: requests.Session, list_url: str = LIST_URL) -> Tuple[str, str]:
     """
@@ -657,42 +667,181 @@ def write_csv(rows: List[Dict[str, str]], out_path: str) -> None:
         for r in rows:
             w.writerow(r)
 
+def list_posts_with_dates(session: requests.Session, list_url: str = LIST_URL) -> List[Tuple[str, str]]:
+    """
+    목록 페이지에서 '오늘의 집회 YYMMDD ...' 형태의 모든 게시글을 (view_url, title_text) 목록으로 반환.
+    *주의*: 현재는 첫 목록 페이지만 찾음(페이지네이션 필요시 확장)
+    """
+    r = session.get(list_url, timeout=20)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    tbody = soup.select_one("#subContents > div > div.inContent > table > tbody")
+    targets = tbody.select("a[href^='javascript:goBoardView']") if tbody \
+        else soup.select("a[href^='javascript:goBoardView']")
+
+    posts: List[Tuple[str, str]] = []
+    for a in targets:
+        title = a.get_text(strip=True) or (a.find_parent('td').get_text(strip=True) if a.find_parent('td') else "")
+        href = a.get("href", "")
+        if not href or "goBoardView" not in href:
+            continue
+        # 제목에 YYMMDD가 없는 글은 스킵 (문구는 유연하게 허용)
+        if not extract_yymmdd_from_title(title):
+            continue
+
+        parsed = parse_goBoardView(href)
+        if not parsed:
+            continue
+        _, _, board_no = parsed
+
+        # view url (두 가지 케이스 중 하나라도 응답 OK면 채택)
+        view_ok = None
+        for url in build_view_urls(board_no):
+            resp = session.get(url, timeout=15)
+            if resp.ok and "html" in (resp.headers.get("Content-Type") or "").lower():
+                view_ok = url
+                break
+        if view_ok:
+            posts.append((view_ok, title))
+    return posts
+
+
+def extract_yymmdd_from_title(title: str) -> Optional[str]:
+    """
+    '오늘의 집회 250822 금' → '250822' 반환
+    """
+    m = re.search(r'(\d{2})(\d{2})(\d{2})', title or "")
+    return m.group(0) if m else None
+
+def download_many_pdfs_with_titles(session: requests.Session,
+                                   posts: List[Tuple[str, str]],
+                                   out_dir: str,
+                                   from_today_only: bool = True,
+                                   days_limit: Optional[int] = 5) -> List[Tuple[str, str, Optional[Tuple[str,str,str]]]]:
+    """
+    주어진 (view_url, title) 목록을 돌며 PDF 다운로드.
+    - from_today_only=True면: 제목의 YYMMDD가 '오늘(KST)' 이상만 고려
+    - days_limit: 오늘 포함 N일치까지만 (기본 5 → 오늘~+4일)
+    return: [(pdf_path, title_text, ymd_tuple), ...]
+    """
+    ensure_dir(out_dir)
+
+    # 오늘(KST) 자정 기준
+    today_kst = datetime.now(ZoneInfo("Asia/Seoul")).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_kst = today_kst + timedelta(days=(days_limit - 1) if days_limit else 0)
+
+    results: List[Tuple[str, str, Optional[Tuple[str,str,str]]]] = []
+
+    # 제목의 YYMMDD 기준으로 정렬
+    def key_date(tup):
+        _, title = tup
+        y6 = extract_yymmdd_from_title(title) or "000000"
+        return y6
+
+    for view_url, title_text in sorted(posts, key=key_date):
+        y6 = extract_yymmdd_from_title(title_text)
+        d = _y6_to_date(y6)
+
+        # 날짜 판별 실패 시 스킵
+        if not d:
+            continue
+
+        # 오늘 이후만
+        if from_today_only and d < today_kst:
+            continue
+
+        # N일 제한 (오늘 포함)
+        if days_limit is not None and d > end_kst:
+            continue
+
+        try:
+            pdf_path = download_from_view(session, view_url, out_dir=out_dir)
+        except Exception as e:
+            print(f"⚠️ PDF 다운로드 실패(건너뜀): {title_text} | {e}")
+            continue
+
+        ymd_tuple = extract_ymd_from_title(title_text)
+        results.append((pdf_path, title_text, ymd_tuple))
+
+    return results
+
+
 # ──────────────────────────────────────────────────────────────────────
 # 실행부
 def main():
     ap = argparse.ArgumentParser(description="SMPA '오늘의 집회' PDF → CSV (파싱+VWorld 지오코딩+종로 필터)")
-    ap.add_argument("--pdf", default=None, help="입력 PDF 경로 (미지정 시 오늘자 게시글에서 자동 다운로드)")
-    ap.add_argument("--out", default=None, help="전체 CSV 저장 경로(기본: ./집회정보.csv)")
+    ap.add_argument("--pdf", default=None, help="입력 PDF 경로 (미지정 시 오늘자 또는 오늘+미래 게시글에서 자동 다운로드)")
+    ap.add_argument("--out", default=None, help="전체 CSV 저장 경로(기본: ./집회정보_통합.csv)")
     ap.add_argument("--attachments-dir", default="attachments", help="자동 다운로드 시 PDF 저장 폴더")
     ap.add_argument("--vworld-key", default=DEFAULT_VWORLD_KEY, help="VWorld API Key (기본: 환경변수 VWORLD_KEY 또는 내장 기본값)")
     ap.add_argument("--no-seoul-filter", action="store_true", help="지오코딩 시 서울 경계 박스 필터 끄기")
     ap.add_argument("--geocode-sleep", type=float, default=0.15, help="지오코딩 요청 간 대기(초)")
+    ap.add_argument("--collect-days", type=int, default=5, help="오늘부터 N일치까지만 수집 (기본=5일, 즉 오늘+4일)")
+    ap.add_argument("--single-today", action="store_true", help="오늘 게시물 1건만 수집(기본은 오늘~+4일 여러 건)")
     args = ap.parse_args()
 
-    ymd: Optional[Tuple[str, str, str]] = None
+    rows_all: List[Dict[str, str]] = []
 
-    # PDF 경로 결정 + 제목에서 날짜 추출
     if args.pdf:
+        # 단일 PDF 모드(기존 그대로)
         pdf_path = args.pdf
         if not os.path.isfile(pdf_path):
             raise SystemExit(f"입력 PDF를 찾을 수 없습니다: {pdf_path}")
+        ymd = None  # 로컬 PDF는 제목정보가 없어 년/월/일 공란 유지
+        print(f"[정보] 로컬 PDF 사용: {pdf_path}")
+        rows = parse_pdf(pdf_path, ymd=ymd)
+        rows_all.extend(rows)
     else:
-        pdf_path, title_text = download_today_pdf_with_title(out_dir=args.attachments_dir)
-        print(f"[정보] 오늘자 PDF 다운로드: {pdf_path}")
-        ymd = extract_ymd_from_title(title_text)
-        if ymd:
-            print(f"[정보] 게시글 제목에서 날짜 추출: {ymd[0]}-{ymd[1]}-{ymd[2]}")
-        else:
-            print("[경고] 제목에서 날짜(YYMMDD)를 찾지 못했습니다. 년/월/일은 공란으로 저장됩니다.")
+        # 자동 다운로드 모드: 오늘만 vs 오늘+미래
+        sess = requests.Session()
+        sess.headers.update({
+            'User-Agent': 'Mozilla/5.0',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8',
+            'Referer': LIST_URL,
+        })
 
-    # 파싱
-    rows = parse_pdf(pdf_path, ymd=ymd)
+        posts = list_posts_with_dates(sess, LIST_URL)
+        if not posts:
+            raise SystemExit("목록에서 날짜가 포함된 게시글을 찾지 못했습니다.")
+
+        if args.single_today:
+            # 오늘 1건만
+            print("[정보] --single-today 지정: 오늘 게시물만 수집")
+            view_url, title_text = get_today_post_info(sess, LIST_URL)
+            bundles = []
+            pdf_path = download_from_view(sess, view_url, out_dir=args.attachments_dir)
+            ymd = extract_ymd_from_title(title_text)
+            print(f"[정보] 오늘자 PDF 다운로드: {pdf_path}")
+            if ymd:
+                print(f"[정보] 게시글 제목에서 날짜 추출: {ymd[0]}-{ymd[1]}-{ymd[2]}")
+            else:
+                print("[경고] 제목에서 날짜(YYMMDD)를 찾지 못했습니다. 년/월/일은 공란으로 저장됩니다.")
+            bundles.append((pdf_path, title_text, ymd))
+        else:
+            # 기본: 오늘(KST)~+N-1일 여러 건
+            print(f"[정보] 기본 모드: 오늘(KST) 포함 {args.collect_days}일치 수집")
+            bundles = download_many_pdfs_with_titles(
+                sess, posts,
+                out_dir=args.attachments_dir,
+                from_today_only=True,
+                days_limit=args.collect_days
+            )
+
+        # 각 PDF 파싱
+        for pdf_path, title_text, ymd in bundles:
+            try:
+                rs = parse_pdf(pdf_path, ymd=ymd)
+                rows_all.extend(rs)
+            except Exception as e:
+                print(f"⚠️ 파싱 실패(건너뜀): {pdf_path} | {e}")
 
     # 지오코딩
     restrict = not args.no_seoul_filter
     if args.vworld_key:
         try:
-            geocode_rows_inplace(rows, vworld_key=args.vworld_key,
+            geocode_rows_inplace(rows_all, vworld_key=args.vworld_key,
                                  restrict_seoul=restrict, sleep_sec=args.geocode_sleep)
         except Exception as e:
             print(f"⚠️ 지오코딩 실패(건너뜀): {e}")
@@ -700,25 +849,20 @@ def main():
         print("ℹ️ VWorld 키가 없어 지오코딩을 건너뜁니다. --vworld-key 또는 환경변수 VWORLD_KEY를 지정하세요.")
 
     # 저장 경로(전체/종로)
-    # 저장 경로(전체/종로)
-    save_dir = os.path.join(os.getcwd(), "data")   # 프로젝트 루트의 data 폴더
-    ensure_dir(save_dir)
-
     if args.out:
-        filename = os.path.basename(args.out)      # 파일명만 가져오기
-        out_all = os.path.join(save_dir, filename)
+        out_all = args.out
     else:
-        out_all = os.path.join(save_dir, "집회정보_통합.csv")
+        out_all = os.path.join(os.getcwd(), "data", "집회정보_통합.csv")
 
     root, ext = os.path.splitext(out_all)
     out_jongno = f"{root}_종로{ext or '.csv'}"
 
     # 저장
-    write_csv(rows, out_all)
-    rows_jongno = filter_rows_jongno(rows)
+    write_csv(rows_all, out_all)
+    rows_jongno = filter_rows_jongno(rows_all)
     write_csv(rows_jongno, out_jongno)
 
-    print(f"[완료] 전체 CSV 저장: {out_all} (총 {len(rows)}행)")
+    print(f"[완료] 전체 CSV 저장: {out_all} (총 {len(rows_all)}행)")
     print(f"[완료] 종로 필터 CSV 저장: {out_jongno} (총 {len(rows_jongno)}행)")
 
 if __name__ == "__main__":
